@@ -39,6 +39,12 @@ python serp_bold_extractor.py "best cfd trading platform" --output json
 python serp_bold_extractor.py "best cfd trading platform" --pages 1
 ```
 
+**HTTP mode (no browser, faster, use if you're getting CAPTCHAs):**
+
+```bash
+python serp_bold_extractor.py "best cfd trading platform" --http
+```
+
 ## CLI Flags
 
 | Flag       | Default | Description                                      |
@@ -48,6 +54,7 @@ python serp_bold_extractor.py "best cfd trading platform" --pages 1
 | `--hl`     | en      | Google `hl` parameter (interface language)        |
 | `--gl`     | us      | Google `gl` parameter (geolocation)               |
 | `--output` | text    | Output format: `text` (one per line) or `json`   |
+| `--http`   | off     | Use plain HTTP requests instead of a browser      |
 
 ## JSON Output Format
 

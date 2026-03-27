@@ -9,10 +9,19 @@ import random
 import shutil
 import subprocess
 import sys
-from urllib.parse import urlencode
+import time
+from urllib.parse import urlencode, quote_plus
+from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 def parse_args():
@@ -50,20 +59,22 @@ def parse_args():
         choices=["text", "json"],
         help="Output format: text (one per line) or json (default: text)",
     )
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Use plain HTTP requests instead of a browser (faster, no Playwright needed)",
+    )
     return parser.parse_args()
 
 
 async def detect_blockers(page):
     """Check for CAPTCHAs and consent walls. Returns 'captcha' or None."""
-    # CAPTCHA: URL contains /sorry/
     if "/sorry/" in page.url:
         return "captcha"
 
-    # CAPTCHA: #captcha-form exists
     if await page.locator("#captcha-form").count() > 0:
         return "captcha"
 
-    # CAPTCHA: page mentions unusual traffic
     try:
         body_text = await page.locator("body").inner_text(timeout=3000)
         if "unusual traffic" in body_text.lower():
@@ -72,24 +83,28 @@ async def detect_blockers(page):
         pass
 
     # Consent wall: try to dismiss
-    try:
-        reject_btn = page.get_by_role("button", name="Reject all")
-        if await reject_btn.count() > 0:
-            await reject_btn.click()
-            await asyncio.sleep(2)
-            return None
-    except Exception:
-        pass
+    for btn_name in ("Reject all", "Accept all"):
+        try:
+            btn = page.get_by_role("button", name=btn_name)
+            if await btn.count() > 0:
+                await btn.click()
+                await asyncio.sleep(2)
+                return None
+        except Exception:
+            pass
 
-    try:
-        accept_btn = page.get_by_role("button", name="Accept all")
-        if await accept_btn.count() > 0:
-            await accept_btn.click()
-            await asyncio.sleep(2)
-            return None
-    except Exception:
-        pass
+    return None
 
+
+def detect_blockers_html(html, url=""):
+    """Check raw HTML for CAPTCHA indicators. Returns 'captcha' or None."""
+    if "/sorry/" in url:
+        return "captcha"
+    lower = html.lower()
+    if 'id="captcha-form"' in lower:
+        return "captcha"
+    if "unusual traffic" in lower:
+        return "captcha"
     return None
 
 
@@ -107,6 +122,91 @@ def extract_from_page(html):
     return terms
 
 
+# ---------------------------------------------------------------------------
+# HTTP-only extraction (no browser)
+# ---------------------------------------------------------------------------
+
+
+def _http_fetch(url):
+    """Fetch a URL with realistic headers. Returns (html, final_url)."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+    req = Request(url, headers=headers)
+    resp = urlopen(req, timeout=15)
+    return resp.read().decode("utf-8", errors="replace"), resp.url
+
+
+def extract_bold_terms_http(query, pages, delay, hl, gl):
+    """Extract bold terms using plain HTTP requests (no browser)."""
+    all_terms = []
+    pages_scraped = 0
+
+    for page_num in range(1, pages + 1):
+        params = {"q": query, "hl": hl, "gl": gl}
+        if page_num > 1:
+            params["start"] = (page_num - 1) * 10
+        url = f"https://www.google.com/search?{urlencode(params)}"
+
+        if page_num > 1:
+            sleep_time = max(0.5, delay + random.uniform(-1.0, 1.0))
+            time.sleep(sleep_time)
+
+        try:
+            html, final_url = _http_fetch(url)
+        except Exception as e:
+            if pages_scraped == 0:
+                return {
+                    "query": query,
+                    "total_terms": 0,
+                    "pages_scraped": 0,
+                    "terms": [],
+                    "error": f"Failed to fetch search results: {e}",
+                }
+            print(f"Failed to fetch page {page_num}: {e}", file=sys.stderr)
+            break
+
+        blocker = detect_blockers_html(html, final_url)
+        if blocker == "captcha":
+            if pages_scraped == 0:
+                return {
+                    "query": query,
+                    "total_terms": len(all_terms),
+                    "pages_scraped": pages_scraped,
+                    "terms": all_terms,
+                    "error": "CAPTCHA detected. Try again later or reduce request frequency.",
+                }
+            print("CAPTCHA on subsequent page, stopping.", file=sys.stderr)
+            break
+
+        terms = extract_from_page(html)
+        for i, term in enumerate(terms):
+            all_terms.append({"term": term, "page": page_num, "position": i + 1})
+        pages_scraped += 1
+
+    return {
+        "query": query,
+        "total_terms": len(all_terms),
+        "pages_scraped": pages_scraped,
+        "terms": all_terms,
+        "error": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Browser-based extraction (Playwright)
+# ---------------------------------------------------------------------------
+
+
 def _start_xvfb():
     """Start Xvfb on a free display and return (process, display_string)."""
     for display_num in range(99, 120):
@@ -116,15 +216,23 @@ def _start_xvfb():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # Give Xvfb a moment to start or fail
         try:
             proc.wait(timeout=0.5)
-            # Process exited quickly — display probably taken, try next
             continue
         except subprocess.TimeoutExpired:
-            # Still running — success
             return proc, display
     return None, None
+
+
+def _find_chrome_channel():
+    """Return 'chrome' if system Google Chrome is installed, else None."""
+    for name in ("google-chrome", "google-chrome-stable"):
+        if shutil.which(name):
+            return "chrome"
+    # macOS
+    if os.path.exists("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"):
+        return "chrome"
+    return None
 
 
 async def extract_bold_terms(query, pages, delay, hl, gl):
@@ -155,24 +263,28 @@ async def extract_bold_terms(query, pages, delay, hl, gl):
 
 
 async def _run_extraction(query, pages, delay, hl, gl, url, headed):
-    """Core extraction logic."""
+    """Core extraction logic using Playwright."""
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=not headed,
-            args=[
+        # Prefer system Chrome over Playwright's bundled Chromium — it has
+        # fewer detectable automation artifacts.
+        channel = _find_chrome_channel()
+
+        launch_kwargs = {
+            "headless": not headed,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-infobars",
                 "--window-size=1920,1080",
             ],
-        )
+        }
+        if channel:
+            launch_kwargs["channel"] = channel
+
+        browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent=USER_AGENT,
             viewport={"width": 1920, "height": 1080},
             screen={"width": 1920, "height": 1080},
             locale="en-US",
@@ -233,7 +345,6 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
         pages_scraped = 0
 
         for page_num in range(1, pages + 1):
-            # Navigate: first page via google.com then search URL, subsequent via #pnnext
             if page_num == 1:
                 await asyncio.sleep(random.uniform(0.5, 1.5))
                 try:
@@ -248,7 +359,6 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
                         "error": f"Failed to reach Google: {e}",
                     }
                 await asyncio.sleep(random.uniform(1.0, 2.0))
-                # Handle consent wall on homepage before searching
                 await detect_blockers(page)
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -262,7 +372,6 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
                         "error": f"Failed to load search results: {e}",
                     }
 
-            # Check for blockers
             blocker = await detect_blockers(page)
             if blocker == "captcha":
                 await browser.close()
@@ -274,7 +383,6 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
                     "error": "CAPTCHA detected. Try again later or reduce request frequency.",
                 }
 
-            # Wait for search results
             try:
                 await page.wait_for_selector("#search", timeout=15000)
             except PlaywrightTimeout:
@@ -284,14 +392,12 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
                 )
                 break
 
-            # Extract terms
             html = await page.content()
             terms = extract_from_page(html)
             for i, term in enumerate(terms):
                 all_terms.append({"term": term, "page": page_num, "position": i + 1})
             pages_scraped += 1
 
-            # Navigate to next page if needed
             if page_num < pages:
                 next_link = page.locator("a#pnnext")
                 if await next_link.count() == 0:
@@ -313,11 +419,22 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
     }
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 def main():
     args = parse_args()
-    result = asyncio.run(
-        extract_bold_terms(args.query, args.pages, args.delay, args.hl, args.gl)
-    )
+
+    if args.http:
+        result = extract_bold_terms_http(
+            args.query, args.pages, args.delay, args.hl, args.gl
+        )
+    else:
+        result = asyncio.run(
+            extract_bold_terms(args.query, args.pages, args.delay, args.hl, args.gl)
+        )
 
     if result.get("error"):
         print(result["error"], file=sys.stderr)
