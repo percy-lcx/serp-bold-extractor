@@ -64,6 +64,11 @@ def parse_args():
         action="store_true",
         help="Use plain HTTP requests instead of a browser (faster, no Playwright needed)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Dump raw HTML to debug_page_N.html files for inspection",
+    )
     return parser.parse_args()
 
 
@@ -147,7 +152,7 @@ def _http_fetch(url):
     return resp.read().decode("utf-8", errors="replace"), resp.url
 
 
-def extract_bold_terms_http(query, pages, delay, hl, gl):
+def extract_bold_terms_http(query, pages, delay, hl, gl, debug=False):
     """Extract bold terms using plain HTTP requests (no browser)."""
     all_terms = []
     pages_scraped = 0
@@ -175,6 +180,13 @@ def extract_bold_terms_http(query, pages, delay, hl, gl):
                 }
             print(f"Failed to fetch page {page_num}: {e}", file=sys.stderr)
             break
+
+        if debug:
+            filename = f"debug_page_{page_num}.html"
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(html)
+            print(f"[debug] Saved {len(html)} bytes to {filename}", file=sys.stderr)
+            print(f"[debug] Final URL: {final_url}", file=sys.stderr)
 
         blocker = detect_blockers_html(html, final_url)
         if blocker == "captcha":
@@ -430,7 +442,7 @@ def main():
 
     if args.http:
         result = extract_bold_terms_http(
-            args.query, args.pages, args.delay, args.hl, args.gl
+            args.query, args.pages, args.delay, args.hl, args.gl, debug=args.debug
         )
     else:
         result = asyncio.run(
@@ -443,7 +455,6 @@ def main():
 
     if not result["terms"]:
         print("No bold terms found for this query.", file=sys.stderr)
-        sys.exit(0)
 
     if args.output == "json":
         output = {
@@ -454,6 +465,8 @@ def main():
         }
         print(json.dumps(output, indent=2, ensure_ascii=False))
     else:
+        if not result["terms"]:
+            sys.exit(0)
         for entry in result["terms"]:
             print(entry["term"])
 
