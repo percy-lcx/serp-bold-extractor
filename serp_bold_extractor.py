@@ -4,7 +4,10 @@
 import argparse
 import asyncio
 import json
+import os
 import random
+import shutil
+import subprocess
 import sys
 from urllib.parse import urlencode
 
@@ -104,14 +107,58 @@ def extract_from_page(html):
     return terms
 
 
+def _start_xvfb():
+    """Start Xvfb on a free display and return (process, display_string)."""
+    for display_num in range(99, 120):
+        display = f":{display_num}"
+        proc = subprocess.Popen(
+            ["Xvfb", display, "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Give Xvfb a moment to start or fail
+        try:
+            proc.wait(timeout=0.5)
+            # Process exited quickly — display probably taken, try next
+            continue
+        except subprocess.TimeoutExpired:
+            # Still running — success
+            return proc, display
+    return None, None
+
+
 async def extract_bold_terms(query, pages, delay, hl, gl):
     """Launch browser, scrape SERP pages, return structured results dict."""
     params = urlencode({"q": query, "hl": hl, "gl": gl})
     url = f"https://www.google.com/search?{params}"
 
+    # Use headed mode with Xvfb virtual display to avoid headless detection
+    use_xvfb = shutil.which("Xvfb") is not None
+    xvfb_proc = None
+    original_display = os.environ.get("DISPLAY")
+
+    if use_xvfb:
+        xvfb_proc, display = _start_xvfb()
+        if xvfb_proc:
+            os.environ["DISPLAY"] = display
+
+    try:
+        return await _run_extraction(query, pages, delay, hl, gl, url, use_xvfb and xvfb_proc is not None)
+    finally:
+        if xvfb_proc:
+            xvfb_proc.terminate()
+            xvfb_proc.wait()
+            if original_display is not None:
+                os.environ["DISPLAY"] = original_display
+            elif "DISPLAY" in os.environ:
+                del os.environ["DISPLAY"]
+
+
+async def _run_extraction(query, pages, delay, hl, gl, url, headed):
+    """Core extraction logic."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=True,
+            headless=not headed,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -189,9 +236,31 @@ async def extract_bold_terms(query, pages, delay, hl, gl):
             # Navigate: first page via google.com then search URL, subsequent via #pnnext
             if page_num == 1:
                 await asyncio.sleep(random.uniform(0.5, 1.5))
-                await page.goto("https://www.google.com", wait_until="domcontentloaded")
+                try:
+                    await page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
+                except (PlaywrightTimeout, Exception) as e:
+                    await browser.close()
+                    return {
+                        "query": query,
+                        "total_terms": 0,
+                        "pages_scraped": 0,
+                        "terms": [],
+                        "error": f"Failed to reach Google: {e}",
+                    }
                 await asyncio.sleep(random.uniform(1.0, 2.0))
-                await page.goto(url, wait_until="domcontentloaded")
+                # Handle consent wall on homepage before searching
+                await detect_blockers(page)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except (PlaywrightTimeout, Exception) as e:
+                    await browser.close()
+                    return {
+                        "query": query,
+                        "total_terms": 0,
+                        "pages_scraped": 0,
+                        "terms": [],
+                        "error": f"Failed to load search results: {e}",
+                    }
 
             # Check for blockers
             blocker = await detect_blockers(page)
