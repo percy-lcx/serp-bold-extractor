@@ -116,6 +116,8 @@ async def extract_bold_terms(query, pages, delay, hl, gl):
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--window-size=1920,1080",
             ],
         )
         context = await browser.new_context(
@@ -125,20 +127,70 @@ async def extract_bold_terms(query, pages, delay, hl, gl):
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1920, "height": 1080},
+            screen={"width": 1920, "height": 1080},
             locale="en-US",
             timezone_id="America/New_York",
+            color_scheme="light",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        await context.add_init_script("""
+            // Hide webdriver property
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+            // Realistic plugins array (standard Chrome PDF plugins)
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => {
+                    const plugins = [
+                        {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
+                        {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
+                        {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
+                    ];
+                    plugins.length = 3;
+                    return plugins;
+                }
+            });
+
+            // Match languages to locale and Accept-Language header
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+
+            // window.chrome must exist in real Chrome
+            window.chrome = {
+                runtime: {
+                    connect: function() {},
+                    sendMessage: function() {}
+                }
+            };
+
+            // Notifications permission should return 'denied', not throw
+            const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = (params) => {
+                if (params.name === 'notifications') {
+                    return Promise.resolve({state: 'denied', onchange: null});
+                }
+                return originalQuery(params);
+            };
+
+            // Realistic WebGL vendor/renderer
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 0x9245) return 'Google Inc. (NVIDIA)';
+                if (parameter === 0x9246) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                return getParameter.call(this, parameter);
+            };
+        """)
 
         page = await context.new_page()
         all_terms = []
         pages_scraped = 0
 
         for page_num in range(1, pages + 1):
-            # Navigate: first page via URL, subsequent pages via #pnnext click
+            # Navigate: first page via google.com then search URL, subsequent via #pnnext
             if page_num == 1:
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                await page.goto("https://www.google.com", wait_until="domcontentloaded")
+                await asyncio.sleep(random.uniform(1.0, 2.0))
                 await page.goto(url, wait_until="domcontentloaded")
 
             # Check for blockers
