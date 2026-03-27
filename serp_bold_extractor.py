@@ -111,12 +111,13 @@ def detect_blockers_html(html, url=""):
 def extract_from_page(html):
     """Extract bold term strings from SERP HTML. Returns list of strings."""
     soup = BeautifulSoup(html, "html.parser")
-    # Try #search container first, fall back to entire page (matches
-    # the user's original BeautifulSoup script behaviour).
+    # Try #search container first, fall back to entire page.
     container = soup.find(id="search") or soup
+    # Google uses <em> in JS-rendered HTML and <b> in raw HTTP responses.
+    # Search for both to handle either case.
     terms = []
-    for em in container.find_all("em"):
-        text = em.get_text(strip=True)
+    for tag in container.find_all(["em", "b"]):
+        text = tag.get_text(strip=True)
         if text:
             terms.append(text)
     return terms
