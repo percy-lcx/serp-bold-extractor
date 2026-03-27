@@ -102,7 +102,7 @@ async def detect_blockers(page):
 
 
 def detect_blockers_html(html, url=""):
-    """Check raw HTML for CAPTCHA indicators. Returns 'captcha' or None."""
+    """Check raw HTML for CAPTCHA or JS challenge indicators. Returns error string or None."""
     if "/sorry/" in url:
         return "captcha"
     lower = html.lower()
@@ -110,6 +110,9 @@ def detect_blockers_html(html, url=""):
         return "captcha"
     if "unusual traffic" in lower:
         return "captcha"
+    # Google JS challenge page — requires browser execution, plain HTTP won't work
+    if "/httpservice/retry/enablejs" in lower or "knitsail" in lower:
+        return "js_challenge"
     return None
 
 
@@ -189,6 +192,18 @@ def extract_bold_terms_http(query, pages, delay, hl, gl, debug=False):
             print(f"[debug] Final URL: {final_url}", file=sys.stderr)
 
         blocker = detect_blockers_html(html, final_url)
+        if blocker == "js_challenge":
+            return {
+                "query": query,
+                "total_terms": 0,
+                "pages_scraped": 0,
+                "terms": [],
+                "error": (
+                    "Google returned a JavaScript challenge page. "
+                    "Plain HTTP mode cannot bypass this — run without "
+                    "--http to use a browser instead."
+                ),
+            }
         if blocker == "captcha":
             if pages_scraped == 0:
                 return {
