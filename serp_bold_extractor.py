@@ -17,11 +17,28 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+def _get_user_agent():
+    """Return a Chrome user-agent string matching the current platform."""
+    if sys.platform == "darwin":
+        return (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+    elif sys.platform.startswith("linux"):
+        return (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+
+
+USER_AGENT = _get_user_agent()
 
 
 def parse_args():
@@ -73,7 +90,7 @@ def parse_args():
 
 
 async def detect_blockers(page):
-    """Check for CAPTCHAs and consent walls. Returns 'captcha' or None."""
+    """Check for CAPTCHAs and consent walls. Returns 'captcha', 'js_challenge', or None."""
     if "/sorry/" in page.url:
         return "captcha"
 
@@ -82,7 +99,14 @@ async def detect_blockers(page):
 
     try:
         body_text = await page.locator("body").inner_text(timeout=3000)
-        if "unusual traffic" in body_text.lower():
+        lower_text = body_text.lower()
+        if "unusual traffic" in lower_text:
+            # Check if this is a JS challenge (not a real CAPTCHA) — the browser
+            # can solve it if we give it time.
+            page_html = await page.content()
+            html_lower = page_html.lower()
+            if "knitsail" in html_lower or "/httpservice/retry/enablejs" in html_lower:
+                return "js_challenge"
             return "captcha"
     except PlaywrightTimeout:
         pass
@@ -263,7 +287,7 @@ def _find_chrome_channel():
     return None
 
 
-async def extract_bold_terms(query, pages, delay, hl, gl):
+async def extract_bold_terms(query, pages, delay, hl, gl, debug=False):
     """Launch browser, scrape SERP pages, return structured results dict."""
     params = urlencode({"q": query, "hl": hl, "gl": gl})
     url = f"https://www.google.com/search?{params}"
@@ -279,7 +303,7 @@ async def extract_bold_terms(query, pages, delay, hl, gl):
             os.environ["DISPLAY"] = display
 
     try:
-        return await _run_extraction(query, pages, delay, hl, gl, url, use_xvfb and xvfb_proc is not None)
+        return await _run_extraction(query, pages, delay, hl, gl, url, use_xvfb and xvfb_proc is not None, debug)
     finally:
         if xvfb_proc:
             xvfb_proc.terminate()
@@ -290,7 +314,7 @@ async def extract_bold_terms(query, pages, delay, hl, gl):
                 del os.environ["DISPLAY"]
 
 
-async def _run_extraction(query, pages, delay, hl, gl, url, headed):
+async def _run_extraction(query, pages, delay, hl, gl, url, headed, debug=False):
     """Core extraction logic using Playwright."""
     async with async_playwright() as p:
         # Prefer system Chrome over Playwright's bundled Chromium — it has
@@ -342,13 +366,16 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
                 get: () => ['en-US', 'en']
             });
 
-            // window.chrome must exist in real Chrome
-            window.chrome = {
-                runtime: {
-                    connect: function() {},
-                    sendMessage: function() {}
-                }
-            };
+            // window.chrome must exist in real Chrome — but don't overwrite
+            // the real object when running system Chrome via channel="chrome"
+            if (!window.chrome) {
+                window.chrome = {
+                    runtime: {
+                        connect: function() {},
+                        sendMessage: function() {}
+                    }
+                };
+            }
 
             // Notifications permission should return 'denied', not throw
             const originalQuery = navigator.permissions.query.bind(navigator.permissions);
@@ -376,7 +403,7 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
             if page_num == 1:
                 await asyncio.sleep(random.uniform(0.5, 1.5))
                 try:
-                    await page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
+                    await page.goto("https://www.google.com", wait_until="networkidle", timeout=30000)
                 except (PlaywrightTimeout, Exception) as e:
                     await browser.close()
                     return {
@@ -386,8 +413,16 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
                         "terms": [],
                         "error": f"Failed to reach Google: {e}",
                     }
+
+                # Wait for any JS challenge to resolve (up to 15s)
+                for _ in range(15):
+                    blocker = await detect_blockers(page)
+                    if blocker == "js_challenge":
+                        await asyncio.sleep(1)
+                        continue
+                    break
+
                 await asyncio.sleep(random.uniform(1.0, 2.0))
-                await detect_blockers(page)
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 except (PlaywrightTimeout, Exception) as e:
@@ -400,7 +435,14 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
                         "error": f"Failed to load search results: {e}",
                     }
 
+            # Check for blockers, waiting through JS challenges
             blocker = await detect_blockers(page)
+            if blocker == "js_challenge":
+                for _ in range(10):
+                    await asyncio.sleep(1)
+                    blocker = await detect_blockers(page)
+                    if blocker != "js_challenge":
+                        break
             if blocker == "captcha":
                 await browser.close()
                 return {
@@ -421,6 +463,12 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed):
                 break
 
             html = await page.content()
+            if debug:
+                filename = f"debug_page_{page_num}.html"
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(html)
+                print(f"[debug] Saved {len(html)} bytes to {filename}", file=sys.stderr)
+                print(f"[debug] Page URL: {page.url}", file=sys.stderr)
             terms = extract_from_page(html)
             for i, term in enumerate(terms):
                 all_terms.append({"term": term, "page": page_num, "position": i + 1})
@@ -461,7 +509,7 @@ def main():
         )
     else:
         result = asyncio.run(
-            extract_bold_terms(args.query, args.pages, args.delay, args.hl, args.gl)
+            extract_bold_terms(args.query, args.pages, args.delay, args.hl, args.gl, debug=args.debug)
         )
 
     if result.get("error"):
