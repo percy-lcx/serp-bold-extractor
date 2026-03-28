@@ -358,6 +358,16 @@ def _detect_browser(pref):
         for name in ("google-chrome", "google-chrome-stable"):
             if shutil.which(name):
                 return {"type": "chromium", "channel": "chrome", "executable": None, "app_name": "Google Chrome"}
+        if sys.platform == "win32":
+            if shutil.which("chrome"):
+                return {"type": "chromium", "channel": "chrome", "executable": None, "app_name": "Google Chrome"}
+            for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+                base = os.environ.get(env_var)
+                if not base:
+                    continue
+                candidate = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
+                if os.path.isfile(candidate):
+                    return {"type": "chromium", "channel": None, "executable": candidate, "app_name": "Google Chrome"}
         if os.path.exists("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"):
             return {"type": "chromium", "channel": "chrome", "executable": None, "app_name": "Google Chrome"}
         return None
@@ -367,6 +377,14 @@ def _detect_browser(pref):
             path = shutil.which(name)
             if path:
                 return {"type": "chromium", "channel": None, "executable": path, "app_name": "Brave Browser"}
+        if sys.platform == "win32":
+            for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+                base = os.environ.get(env_var)
+                if not base:
+                    continue
+                candidate = os.path.join(base, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")
+                if os.path.isfile(candidate):
+                    return {"type": "chromium", "channel": None, "executable": candidate, "app_name": "Brave Browser"}
         brave_mac = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
         if os.path.exists(brave_mac):
             return {"type": "chromium", "channel": None, "executable": brave_mac, "app_name": "Brave Browser"}
@@ -377,6 +395,14 @@ def _detect_browser(pref):
             path = shutil.which(name)
             if path:
                 return {"type": "firefox", "channel": None, "executable": path, "app_name": "Firefox"}
+        if sys.platform == "win32":
+            for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+                base = os.environ.get(env_var)
+                if not base:
+                    continue
+                candidate = os.path.join(base, "Mozilla Firefox", "firefox.exe")
+                if os.path.isfile(candidate):
+                    return {"type": "firefox", "channel": None, "executable": candidate, "app_name": "Firefox"}
         ff_mac = "/Applications/Firefox.app/Contents/MacOS/firefox"
         if os.path.exists(ff_mac):
             return {"type": "firefox", "channel": None, "executable": ff_mac, "app_name": "Firefox"}
@@ -400,8 +426,8 @@ def _detect_browser(pref):
 
 async def extract_bold_terms_batch(queries, pages, delay, hl, gl, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None, save_html_dir=None, concurrency=3):
     """Launch browser once, scrape all queries, return list of result dicts."""
-    # On macOS a real display is always available — run headed without Xvfb.
-    if sys.platform == "darwin":
+    # On macOS/Windows a real display is always available — run headed without Xvfb.
+    if sys.platform in ("darwin", "win32"):
         return await _run_extraction_batch(queries, pages, delay, hl, gl, True, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info, save_html_dir=save_html_dir, concurrency=concurrency)
 
     # On Linux: use headed mode with Xvfb virtual display to avoid headless detection
@@ -467,7 +493,13 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
     # Use manual lifecycle management instead of `async with` so we can apply
     # a timeout to both browser.close() and playwright.stop().
     if is_chromium:
-        _stealth = Stealth(navigator_platform_override="MacIntel")
+        if sys.platform == "win32":
+            _nav_platform = "Win32"
+        elif sys.platform == "darwin":
+            _nav_platform = "MacIntel"
+        else:
+            _nav_platform = "Linux x86_64"
+        _stealth = Stealth(navigator_platform_override=_nav_platform)
         _pw_cm = _stealth.use_async(async_playwright())
     else:
         _stealth = None
