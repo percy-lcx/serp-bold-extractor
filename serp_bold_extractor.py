@@ -749,7 +749,7 @@ async def _extract_single_query(page, query, pages, delay, hl, gl, app_name, hea
             terms = await page.evaluate(
                 "() => Array.from("
                 "  document.querySelectorAll('#search em')"
-                ").map(el => el.textContent.trim()).filter(t => t.length > 0)"
+                ").map(el => el.textContent.replace(/\\s+/g, ' ').trim()).filter(t => t.length > 0)"
             )
         _log(f"page {page_num}: {len(terms)} terms extracted", t0, verbose)
         for i, term in enumerate(terms):
