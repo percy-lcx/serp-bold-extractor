@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -124,6 +125,18 @@ notes:
         metavar="FILE",
         help="Path to a TXT file with one query per line",
     )
+    parser.add_argument(
+        "--save-html",
+        metavar="DIR",
+        help="Save raw SERP HTML for each page to DIR/{query}_page{N}.html",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Number of parallel browser tabs for batch queries (default: 3, range: 1-5)",
+    )
     return parser.parse_args()
 
 
@@ -206,6 +219,14 @@ def extract_from_page(html):
 # ---------------------------------------------------------------------------
 
 
+def _save_page_html(html, save_html_dir, query, page_num):
+    safe = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")[:60]
+    os.makedirs(save_html_dir, exist_ok=True)
+    path = os.path.join(save_html_dir, f"{safe}_page{page_num}.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
 def _http_fetch(url):
     """Fetch a URL with realistic headers. Returns (html, final_url)."""
     headers = {
@@ -225,10 +246,11 @@ def _http_fetch(url):
     return resp.read().decode("utf-8", errors="replace"), resp.url
 
 
-def extract_bold_terms_http(query, pages, delay, hl, gl, debug=False):
+def extract_bold_terms_http(query, pages, delay, hl, gl, debug=False, save_html_dir=None):
     """Extract bold terms using plain HTTP requests (no browser)."""
     all_terms = []
     pages_scraped = 0
+    seen = set()
 
     for page_num in range(1, pages + 1):
         params = {"q": query, "hl": hl, "gl": gl}
@@ -261,6 +283,9 @@ def extract_bold_terms_http(query, pages, delay, hl, gl, debug=False):
             print(f"[debug] Saved {len(html)} bytes to {filename}", file=sys.stderr)
             print(f"[debug] Final URL: {final_url}", file=sys.stderr)
 
+        if save_html_dir:
+            _save_page_html(html, save_html_dir, query, page_num)
+
         blocker = detect_blockers_html(html, final_url)
         if blocker == "js_challenge":
             return {
@@ -288,6 +313,9 @@ def extract_bold_terms_http(query, pages, delay, hl, gl, debug=False):
 
         terms = extract_from_page(html)
         for i, term in enumerate(terms):
+            if term.lower() in seen:
+                continue
+            seen.add(term.lower())
             all_terms.append({"term": term, "page": page_num, "position": i + 1})
         pages_scraped += 1
 
@@ -370,11 +398,11 @@ def _detect_browser(pref):
     return _try_chrome() or _try_brave() or _try_firefox() or _bundled()
 
 
-async def extract_bold_terms_batch(queries, pages, delay, hl, gl, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None):
+async def extract_bold_terms_batch(queries, pages, delay, hl, gl, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None, save_html_dir=None, concurrency=3):
     """Launch browser once, scrape all queries, return list of result dicts."""
     # On macOS a real display is always available — run headed without Xvfb.
     if sys.platform == "darwin":
-        return await _run_extraction_batch(queries, pages, delay, hl, gl, True, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info)
+        return await _run_extraction_batch(queries, pages, delay, hl, gl, True, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info, save_html_dir=save_html_dir, concurrency=concurrency)
 
     # On Linux: use headed mode with Xvfb virtual display to avoid headless detection
     use_xvfb = shutil.which("Xvfb") is not None
@@ -387,7 +415,7 @@ async def extract_bold_terms_batch(queries, pages, delay, hl, gl, debug=False, o
             os.environ["DISPLAY"] = display
 
     try:
-        return await _run_extraction_batch(queries, pages, delay, hl, gl, use_xvfb and xvfb_proc is not None, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info)
+        return await _run_extraction_batch(queries, pages, delay, hl, gl, use_xvfb and xvfb_proc is not None, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info, save_html_dir=save_html_dir, concurrency=concurrency)
     finally:
         if xvfb_proc:
             xvfb_proc.terminate()
@@ -429,7 +457,7 @@ def _macos_activate(app_name):
         pass
 
 
-async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None):
+async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None, save_html_dir=None, concurrency=3):
     """Launch browser once, process all queries, return list of result dicts."""
     t0 = time.perf_counter()
     _log(f'launching {browser_info["app_name"]}', t0, verbose)
@@ -494,41 +522,85 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
         await asyncio.sleep(0.5)
         _macos_activate(prior_app)
 
-    page = context.pages[0] if context.pages else await context.new_page()
+    # Start with a single tab only — opening multiple tabs upfront triggers
+    # aggressive CAPTCHA detection on unestablished sessions.
+    first_page = context.pages[0] if context.pages else await context.new_page()
 
-    # One-time google.com warmup to establish session and clear any JS challenges
-    await asyncio.sleep(random.uniform(0.5, 1.5))
-    _log("navigating to google.com", t0, verbose)
-    try:
-        await page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
-    except (PlaywrightTimeout, Exception) as e:
-        err = f"Failed to reach Google: {e}"
+    # Warmup: navigate to google.com on first run to establish session.
+    # Skip if profile already exists (session is still valid).
+    session_exists = os.path.isdir(profile_dir) and bool(os.listdir(profile_dir))
+    if not session_exists:
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        _log("navigating to google.com (first-run warmup)", t0, verbose)
         try:
-            await asyncio.wait_for(context.close(), timeout=2.0)
-        except (asyncio.TimeoutError, Exception):
-            pass
-        try:
-            await asyncio.wait_for(_pw_cm.__aexit__(None, None, None), timeout=2.0)
-        except (asyncio.TimeoutError, Exception):
-            pass
-        return [{"query": q, "total_terms": 0, "pages_scraped": 0, "terms": [], "error": err} for q in queries]
-    _log("google.com loaded", t0, verbose)
+            await first_page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
+        except (PlaywrightTimeout, Exception) as e:
+            err = f"Failed to reach Google: {e}"
+            try:
+                await asyncio.wait_for(context.close(), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            try:
+                await asyncio.wait_for(_pw_cm.__aexit__(None, None, None), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            return [{"query": q, "total_terms": 0, "pages_scraped": 0, "terms": [], "error": err} for q in queries]
+        _log("google.com loaded", t0, verbose)
 
     for _ in range(15):
-        blocker = await detect_blockers(page)
+        blocker = await detect_blockers(first_page)
         if blocker == "js_challenge":
             await asyncio.sleep(1)
             continue
         break
 
     app_name = browser_info["app_name"]
+    multi = len(queries) > 1
     results = []
     try:
-        for query in queries:
-            if on_query_start:
-                on_query_start(query)
-            result = await _extract_single_query(page, query, pages, delay, hl, gl, app_name, headed, debug, on_term, verbose, t0)
-            results.append(result)
+        if concurrency == 1:
+            # Sequential mode: preserve streaming output
+            for query in queries:
+                if on_query_start:
+                    on_query_start(query)
+                result = await _extract_single_query(first_page, query, pages, delay, hl, gl, app_name, headed, debug, on_term, verbose, t0, save_html_dir=save_html_dir)
+                results.append(result)
+        else:
+            # Parallel mode: query 1 runs alone on the single tab (handles any
+            # CAPTCHA), then extra tabs are opened and queries 2-N run in parallel.
+            first_result = await _extract_single_query(first_page, queries[0], pages, delay, hl, gl, app_name, headed, debug, None, verbose, t0, save_html_dir=save_html_dir)
+            results = [first_result]
+
+            if len(queries) > 1:
+                n_tabs = min(concurrency, len(queries) - 1)
+                extra_tabs = [await context.new_page() for _ in range(n_tabs)]
+                tab_pool = [first_page] + extra_tabs
+
+                tab_q = asyncio.Queue()
+                for tab in tab_pool:
+                    await tab_q.put(tab)
+
+                async def run_one(query):
+                    tab = await tab_q.get()
+                    try:
+                        return await _extract_single_query(tab, query, pages, delay, hl, gl, app_name, headed, debug, None, verbose, t0, save_html_dir=save_html_dir)
+                    finally:
+                        await tab_q.put(tab)
+
+                raw = await asyncio.gather(*[run_one(q) for q in queries[1:]], return_exceptions=True)
+                for q, r in zip(queries[1:], raw):
+                    if isinstance(r, BaseException):
+                        results.append({"query": q, "total_terms": 0, "pages_scraped": 0, "terms": [], "error": str(r)})
+                    else:
+                        results.append(r)
+
+            # Emit all buffered output in original query order
+            for result in results:
+                if multi and on_query_start:
+                    on_query_start(result["query"])
+                if on_term:
+                    for entry in result.get("terms", []):
+                        on_term(entry)
     finally:
         _log("closing browser", t0, verbose)
         try:
@@ -545,14 +617,14 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
     return results
 
 
-async def _extract_single_query(page, query, pages, delay, hl, gl, app_name, headed, debug, on_term, verbose, t0):
+async def _extract_single_query(page, query, pages, delay, hl, gl, app_name, headed, debug, on_term, verbose, t0, save_html_dir=None):
     """Navigate to a search URL and extract <em> terms for one query. Returns result dict."""
     params = urlencode({"q": query, "hl": hl, "gl": gl})
     url = f"https://www.google.com/search?{params}"
     all_terms = []
     pages_scraped = 0
+    seen = set()
 
-    await asyncio.sleep(random.uniform(0.5, 1.5))
     _log(f'navigating to search: "{query}"', t0, verbose)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -631,6 +703,9 @@ async def _extract_single_query(page, query, pages, delay, hl, gl, app_name, hea
             break
         _log(f"page {page_num}: snippets ready", t0, verbose)
 
+        if save_html_dir:
+            _save_page_html(await page.content(), save_html_dir, query, page_num)
+
         if html is not None:
             # Debug mode already fetched full HTML — parse it directly.
             terms = extract_from_page(html)
@@ -646,6 +721,9 @@ async def _extract_single_query(page, query, pages, delay, hl, gl, app_name, hea
             )
         _log(f"page {page_num}: {len(terms)} terms extracted", t0, verbose)
         for i, term in enumerate(terms):
+            if term.lower() in seen:
+                continue
+            seen.add(term.lower())
             entry = {"term": term, "page": page_num, "position": i + 1}
             all_terms.append(entry)
             if on_term:
@@ -715,7 +793,7 @@ def main():
             if on_query_start:
                 on_query_start(query)
             all_results.append(
-                extract_bold_terms_http(query, args.pages, args.delay, args.hl, args.gl, debug=args.debug)
+                extract_bold_terms_http(query, args.pages, args.delay, args.hl, args.gl, debug=args.debug, save_html_dir=args.save_html)
             )
     else:
         browser_info = _detect_browser(args.browser)
@@ -729,6 +807,7 @@ def main():
                 queries, args.pages, args.delay, args.hl, args.gl,
                 debug=args.debug, on_query_start=on_query_start, on_term=on_term,
                 verbose=args.verbose, profile_dir=profile_dir, browser_info=browser_info,
+                save_html_dir=args.save_html, concurrency=args.concurrency,
             )
         )
 
