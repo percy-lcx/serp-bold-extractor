@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright_stealth import Stealth
 
 
 def _get_user_agent():
@@ -39,13 +40,29 @@ def _get_user_agent():
 
 
 USER_AGENT = _get_user_agent()
+DEFAULT_PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".serp-bold-extractor", "profile")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Extract bold (<em>) terms from Google search result pages."
+        description="Extract bold (<em>/<b>) terms from Google search result pages.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  python3 serp_bold_extractor.py "what is bitcoin" --pages 1
+  python3 serp_bold_extractor.py "best crypto wallets" --pages 3 --delay 1.5
+  python3 serp_bold_extractor.py "ethereum staking" --pages 2 > results.txt
+  python3 serp_bold_extractor.py "defi explained" --output json > results.json
+  python3 serp_bold_extractor.py "web3" --pages 2 --verbose
+  python3 serp_bold_extractor.py "nft meaning" --pages 1 --debug
+
+notes:
+  On first run Chrome opens visibly. If Google shows a CAPTCHA, solve it once —
+  the session is saved to --profile-dir and reused on all future runs (~6 months).
+  To reset the session: rm -rf ~/.serp-bold-extractor/profile
+"""
     )
-    parser.add_argument("query", help="The Google search query string")
+    parser.add_argument("query", nargs="?", help="The Google search query string")
     parser.add_argument(
         "--pages",
         type=int,
@@ -86,7 +103,34 @@ def parse_args():
         action="store_true",
         help="Dump raw HTML to debug_page_N.html files for inspection",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print timestamped progress messages to stderr",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        default=DEFAULT_PROFILE_DIR,
+        help="Persistent browser profile directory (default: ~/.serp-bold-extractor/profile, or profile-firefox for Firefox)",
+    )
+    parser.add_argument(
+        "--browser",
+        default="auto",
+        choices=["auto", "chrome", "brave", "firefox", "chromium"],
+        help="Browser to use: auto (default), chrome, brave, firefox, or chromium (Playwright bundled)",
+    )
+    parser.add_argument(
+        "--file", "-f",
+        metavar="FILE",
+        help="Path to a TXT file with one query per line",
+    )
     return parser.parse_args()
+
+
+def load_queries_from_file(path):
+    """Read queries from a text file, one per line. Empty lines are skipped."""
+    with open(path, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
 
 async def detect_blockers(page):
@@ -97,19 +141,21 @@ async def detect_blockers(page):
     if await page.locator("#captcha-form").count() > 0:
         return "captcha"
 
-    try:
-        body_text = await page.locator("body").inner_text(timeout=3000)
-        lower_text = body_text.lower()
-        if "unusual traffic" in lower_text:
-            # Check if this is a JS challenge (not a real CAPTCHA) — the browser
-            # can solve it if we give it time.
-            page_html = await page.content()
-            html_lower = page_html.lower()
-            if "knitsail" in html_lower or "/httpservice/retry/enablejs" in html_lower:
-                return "js_challenge"
-            return "captcha"
-    except PlaywrightTimeout:
-        pass
+    # "Unusual traffic" only appears on /sorry/ pages which Google always redirects to —
+    # it is never shown inline on a search results page, so skip the expensive full-body
+    # text scan when we're already on a normal search URL.
+    if "google.com/search" not in page.url:
+        try:
+            body_text = await page.locator("body").inner_text(timeout=3000)
+            lower_text = body_text.lower()
+            if "unusual traffic" in lower_text:
+                page_html = await page.content()
+                html_lower = page_html.lower()
+                if "knitsail" in html_lower or "/httpservice/retry/enablejs" in html_lower:
+                    return "js_challenge"
+                return "captcha"
+        except PlaywrightTimeout:
+            pass
 
     # Consent wall: try to dismiss
     for btn_name in ("Reject all", "Accept all"):
@@ -148,7 +194,7 @@ def extract_from_page(html):
     # Google uses <em> in JS-rendered HTML and <b> in raw HTTP responses.
     # Search for both to handle either case.
     terms = []
-    for tag in container.find_all(["em", "b"]):
+    for tag in container.find_all("em"):
         text = tag.get_text(strip=True)
         if text:
             terms.append(text)
@@ -276,23 +322,61 @@ def _start_xvfb():
     return None, None
 
 
-def _find_chrome_channel():
-    """Return 'chrome' if system Google Chrome is installed, else None."""
-    for name in ("google-chrome", "google-chrome-stable"):
-        if shutil.which(name):
-            return "chrome"
-    # macOS
-    if os.path.exists("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"):
-        return "chrome"
-    return None
+def _detect_browser(pref):
+    """Detect a browser based on preference string.
+    Returns dict: {type, channel, executable, app_name}
+    """
+    def _try_chrome():
+        for name in ("google-chrome", "google-chrome-stable"):
+            if shutil.which(name):
+                return {"type": "chromium", "channel": "chrome", "executable": None, "app_name": "Google Chrome"}
+        if os.path.exists("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"):
+            return {"type": "chromium", "channel": "chrome", "executable": None, "app_name": "Google Chrome"}
+        return None
+
+    def _try_brave():
+        for name in ("brave-browser", "brave", "brave-browser-stable"):
+            path = shutil.which(name)
+            if path:
+                return {"type": "chromium", "channel": None, "executable": path, "app_name": "Brave Browser"}
+        brave_mac = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+        if os.path.exists(brave_mac):
+            return {"type": "chromium", "channel": None, "executable": brave_mac, "app_name": "Brave Browser"}
+        return None
+
+    def _try_firefox():
+        for name in ("firefox", "firefox-esr"):
+            path = shutil.which(name)
+            if path:
+                return {"type": "firefox", "channel": None, "executable": path, "app_name": "Firefox"}
+        ff_mac = "/Applications/Firefox.app/Contents/MacOS/firefox"
+        if os.path.exists(ff_mac):
+            return {"type": "firefox", "channel": None, "executable": ff_mac, "app_name": "Firefox"}
+        return None
+
+    def _bundled():
+        return {"type": "chromium", "channel": None, "executable": None, "app_name": "Chromium"}
+
+    if pref == "chrome":   return _try_chrome()   or _bundled()
+    if pref == "brave":    return _try_brave()    or _bundled()
+    if pref == "chromium": return _bundled()
+    if pref == "firefox":
+        found = _try_firefox()
+        if not found:
+            print("error: Firefox not found", file=sys.stderr)
+            sys.exit(1)
+        return found
+    # auto: Chrome > Brave > Firefox > bundled Chromium
+    return _try_chrome() or _try_brave() or _try_firefox() or _bundled()
 
 
-async def extract_bold_terms(query, pages, delay, hl, gl, debug=False):
-    """Launch browser, scrape SERP pages, return structured results dict."""
-    params = urlencode({"q": query, "hl": hl, "gl": gl})
-    url = f"https://www.google.com/search?{params}"
+async def extract_bold_terms_batch(queries, pages, delay, hl, gl, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None):
+    """Launch browser once, scrape all queries, return list of result dicts."""
+    # On macOS a real display is always available — run headed without Xvfb.
+    if sys.platform == "darwin":
+        return await _run_extraction_batch(queries, pages, delay, hl, gl, True, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info)
 
-    # Use headed mode with Xvfb virtual display to avoid headless detection
+    # On Linux: use headed mode with Xvfb virtual display to avoid headless detection
     use_xvfb = shutil.which("Xvfb") is not None
     xvfb_proc = None
     original_display = os.environ.get("DISPLAY")
@@ -303,7 +387,7 @@ async def extract_bold_terms(query, pages, delay, hl, gl, debug=False):
             os.environ["DISPLAY"] = display
 
     try:
-        return await _run_extraction(query, pages, delay, hl, gl, url, use_xvfb and xvfb_proc is not None, debug)
+        return await _run_extraction_batch(queries, pages, delay, hl, gl, use_xvfb and xvfb_proc is not None, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info)
     finally:
         if xvfb_proc:
             xvfb_proc.terminate()
@@ -314,137 +398,222 @@ async def extract_bold_terms(query, pages, delay, hl, gl, debug=False):
                 del os.environ["DISPLAY"]
 
 
-async def _run_extraction(query, pages, delay, hl, gl, url, headed, debug=False):
-    """Core extraction logic using Playwright."""
-    async with async_playwright() as p:
-        # Prefer system Chrome over Playwright's bundled Chromium — it has
-        # fewer detectable automation artifacts.
-        channel = _find_chrome_channel()
+def _log(msg, t0, verbose):
+    if verbose:
+        print(f"[+{time.perf_counter() - t0:.2f}s] {msg}", file=sys.stderr, flush=True)
 
-        launch_kwargs = {
-            "headless": not headed,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-infobars",
-                "--window-size=1920,1080",
-            ],
-        }
-        if channel:
-            launch_kwargs["channel"] = channel
 
-        browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1920, "height": 1080},
-            screen={"width": 1920, "height": 1080},
-            locale="en-US",
-            timezone_id="America/New_York",
-            color_scheme="light",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+def _macos_get_frontmost():
+    """Return the name of the currently focused macOS app."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             "tell application \"System Events\" to get name of first process whose frontmost is true"],
+            capture_output=True, text=True, timeout=3,
         )
-        await context.add_init_script("""
-            // Hide webdriver property
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        return r.stdout.strip() or None
+    except Exception:
+        return None
 
-            // Realistic plugins array (standard Chrome PDF plugins)
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => {
-                    const plugins = [
-                        {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
-                        {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
-                        {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
-                    ];
-                    plugins.length = 3;
-                    return plugins;
-                }
-            });
 
-            // Match languages to locale and Accept-Language header
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en']
-            });
+def _macos_activate(app_name):
+    """Bring a macOS app to the foreground by name."""
+    if not app_name:
+        return
+    try:
+        subprocess.run(
+            ["osascript", "-e", f"tell application \"{app_name}\" to activate"],
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        pass
 
-            // window.chrome must exist in real Chrome — but don't overwrite
-            // the real object when running system Chrome via channel="chrome"
-            if (!window.chrome) {
-                window.chrome = {
-                    runtime: {
-                        connect: function() {},
-                        sendMessage: function() {}
-                    }
-                };
-            }
 
-            // Notifications permission should return 'denied', not throw
-            const originalQuery = navigator.permissions.query.bind(navigator.permissions);
-            navigator.permissions.query = (params) => {
-                if (params.name === 'notifications') {
-                    return Promise.resolve({state: 'denied', onchange: null});
-                }
-                return originalQuery(params);
-            };
+async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None):
+    """Launch browser once, process all queries, return list of result dicts."""
+    t0 = time.perf_counter()
+    _log(f'launching {browser_info["app_name"]}', t0, verbose)
 
-            // Realistic WebGL vendor/renderer
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 0x9245) return 'Google Inc. (NVIDIA)';
-                if (parameter === 0x9246) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-                return getParameter.call(this, parameter);
-            };
-        """)
+    is_chromium = browser_info["type"] == "chromium"
 
-        page = await context.new_page()
-        all_terms = []
-        pages_scraped = 0
+    # Use manual lifecycle management instead of `async with` so we can apply
+    # a timeout to both browser.close() and playwright.stop().
+    if is_chromium:
+        _stealth = Stealth(navigator_platform_override="MacIntel")
+        _pw_cm = _stealth.use_async(async_playwright())
+    else:
+        _stealth = None
+        _pw_cm = async_playwright()
+    p = await _pw_cm.__aenter__()
 
-        for page_num in range(1, pages + 1):
-            if page_num == 1:
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-                try:
-                    await page.goto("https://www.google.com", wait_until="networkidle", timeout=30000)
-                except (PlaywrightTimeout, Exception) as e:
-                    await browser.close()
-                    return {
-                        "query": query,
-                        "total_terms": 0,
-                        "pages_scraped": 0,
-                        "terms": [],
-                        "error": f"Failed to reach Google: {e}",
-                    }
+    os.makedirs(profile_dir, exist_ok=True)
 
-                # Wait for any JS challenge to resolve (up to 15s)
-                for _ in range(15):
-                    blocker = await detect_blockers(page)
-                    if blocker == "js_challenge":
-                        await asyncio.sleep(1)
-                        continue
+    if is_chromium:
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-infobars",
+            "--window-size=1920,1080",
+        ]
+        persistent_kwargs = {
+            "headless": not headed,
+            "args": browser_args,
+            "user_agent": USER_AGENT,
+            "viewport": {"width": 1920, "height": 1080},
+            "screen": {"width": 1920, "height": 1080},
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "color_scheme": "light",
+            "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        }
+        if browser_info["channel"]:
+            persistent_kwargs["channel"] = browser_info["channel"]
+        elif browser_info["executable"]:
+            persistent_kwargs["executable_path"] = browser_info["executable"]
+        context = await p.chromium.launch_persistent_context(profile_dir, **persistent_kwargs)
+        await _stealth.apply_stealth_async(context)
+    else:  # Firefox
+        persistent_kwargs = {
+            "headless": not headed,
+            "viewport": {"width": 1920, "height": 1080},
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "color_scheme": "light",
+            "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        }
+        if browser_info["executable"]:
+            persistent_kwargs["executable_path"] = browser_info["executable"]
+        context = await p.firefox.launch_persistent_context(profile_dir, **persistent_kwargs)
+
+    _log("browser launched", t0, verbose)
+
+    # Return focus to whatever was frontmost before the browser launched
+    prior_app = _macos_get_frontmost() if sys.platform == "darwin" else None
+    if prior_app:
+        await asyncio.sleep(0.5)
+        _macos_activate(prior_app)
+
+    page = context.pages[0] if context.pages else await context.new_page()
+
+    # One-time google.com warmup to establish session and clear any JS challenges
+    await asyncio.sleep(random.uniform(0.5, 1.5))
+    _log("navigating to google.com", t0, verbose)
+    try:
+        await page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
+    except (PlaywrightTimeout, Exception) as e:
+        err = f"Failed to reach Google: {e}"
+        try:
+            await asyncio.wait_for(context.close(), timeout=2.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        try:
+            await asyncio.wait_for(_pw_cm.__aexit__(None, None, None), timeout=2.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        return [{"query": q, "total_terms": 0, "pages_scraped": 0, "terms": [], "error": err} for q in queries]
+    _log("google.com loaded", t0, verbose)
+
+    for _ in range(15):
+        blocker = await detect_blockers(page)
+        if blocker == "js_challenge":
+            await asyncio.sleep(1)
+            continue
+        break
+
+    app_name = browser_info["app_name"]
+    results = []
+    try:
+        for query in queries:
+            if on_query_start:
+                on_query_start(query)
+            result = await _extract_single_query(page, query, pages, delay, hl, gl, app_name, headed, debug, on_term, verbose, t0)
+            results.append(result)
+    finally:
+        _log("closing browser", t0, verbose)
+        try:
+            await asyncio.wait_for(context.close(), timeout=2.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        _log("browser closed — stopping Playwright", t0, verbose)
+        try:
+            await asyncio.wait_for(_pw_cm.__aexit__(None, None, None), timeout=2.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+        _log("done", t0, verbose)
+
+    return results
+
+
+async def _extract_single_query(page, query, pages, delay, hl, gl, app_name, headed, debug, on_term, verbose, t0):
+    """Navigate to a search URL and extract <em> terms for one query. Returns result dict."""
+    params = urlencode({"q": query, "hl": hl, "gl": gl})
+    url = f"https://www.google.com/search?{params}"
+    all_terms = []
+    pages_scraped = 0
+
+    await asyncio.sleep(random.uniform(0.5, 1.5))
+    _log(f'navigating to search: "{query}"', t0, verbose)
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    except (PlaywrightTimeout, Exception) as e:
+        return {"query": query, "total_terms": 0, "pages_scraped": 0, "terms": [], "error": f"Failed to load search results: {e}"}
+    _log(f'search loaded: "{query}"', t0, verbose)
+
+    for page_num in range(1, pages + 1):
+        # Save debug HTML before blocker check so it's always captured
+        if debug:
+            html = await page.content()
+            filename = f"debug_page_{page_num}.html"
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(html)
+            print(f"[debug] Saved {len(html)} bytes to {filename}", file=sys.stderr)
+            print(f"[debug] Page URL: {page.url}", file=sys.stderr)
+        else:
+            html = None
+
+        # Check for blockers, waiting through JS challenges
+        blocker = await detect_blockers(page)
+        if blocker == "js_challenge":
+            for _ in range(10):
+                await asyncio.sleep(1)
+                blocker = await detect_blockers(page)
+                if blocker != "js_challenge":
                     break
-
-                await asyncio.sleep(random.uniform(1.0, 2.0))
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                except (PlaywrightTimeout, Exception) as e:
-                    await browser.close()
+        if blocker == "captcha":
+            if headed:
+                _macos_activate(app_name)
+                print(
+                    "\nCAPTCHA detected — please solve it in the browser window. "
+                    "Your session will be saved so future runs won't need this. "
+                    "Continuing automatically once solved (timeout: 2 min).",
+                    file=sys.stderr,
+                )
+                for _ in range(60):
+                    await asyncio.sleep(2)
+                    try:
+                        if "/sorry/" not in page.url:
+                            print("[info] CAPTCHA solved, resuming...", file=sys.stderr, flush=True)
+                            _log("CAPTCHA solved", t0, verbose)
+                            break
+                    except Exception:
+                        break
+                else:
                     return {
                         "query": query,
-                        "total_terms": 0,
-                        "pages_scraped": 0,
-                        "terms": [],
-                        "error": f"Failed to load search results: {e}",
+                        "total_terms": len(all_terms),
+                        "pages_scraped": pages_scraped,
+                        "terms": all_terms,
+                        "error": "CAPTCHA not solved within 2 minutes.",
                     }
-
-            # Check for blockers, waiting through JS challenges
-            blocker = await detect_blockers(page)
-            if blocker == "js_challenge":
-                for _ in range(10):
-                    await asyncio.sleep(1)
-                    blocker = await detect_blockers(page)
-                    if blocker != "js_challenge":
-                        break
-            if blocker == "captcha":
-                await browser.close()
+                # Re-save debug HTML after CAPTCHA resolution
+                if debug:
+                    html = await page.content()
+                    filename = f"debug_page_{page_num}.html"
+                    with open(filename, "w", encoding="utf-8") as f:
+                        f.write(html)
+                    print(f"[debug] Post-CAPTCHA: saved {len(html)} bytes to {filename}", file=sys.stderr)
+            else:
                 return {
                     "query": query,
                     "total_terms": len(all_terms),
@@ -453,38 +622,49 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed, debug=False)
                     "error": "CAPTCHA detected. Try again later or reduce request frequency.",
                 }
 
-            try:
-                await page.wait_for_selector("#search", timeout=15000)
-            except PlaywrightTimeout:
-                print(
-                    f"Timeout waiting for results on page {page_num}.",
-                    file=sys.stderr,
-                )
-                break
+        # Wait for rendered result snippets (<em> tags appear after JS renders)
+        _log(f"page {page_num}: waiting for result snippets", t0, verbose)
+        try:
+            await page.wait_for_selector("#search em", timeout=30000)
+        except PlaywrightTimeout:
+            print(f"Timeout waiting for results on page {page_num}.", file=sys.stderr)
+            break
+        _log(f"page {page_num}: snippets ready", t0, verbose)
 
-            html = await page.content()
-            if debug:
-                filename = f"debug_page_{page_num}.html"
-                with open(filename, "w", encoding="utf-8") as f:
-                    f.write(html)
-                print(f"[debug] Saved {len(html)} bytes to {filename}", file=sys.stderr)
-                print(f"[debug] Page URL: {page.url}", file=sys.stderr)
+        if html is not None:
+            # Debug mode already fetched full HTML — parse it directly.
             terms = extract_from_page(html)
-            for i, term in enumerate(terms):
-                all_terms.append({"term": term, "page": page_num, "position": i + 1})
-            pages_scraped += 1
+        else:
+            # Use a JS DOM query instead of fetching the full page HTML.
+            # This avoids serialising ~1.7 MB of HTML over the CDP channel
+            # and skips BeautifulSoup parsing entirely.
+            _log(f"page {page_num}: running JS term extraction", t0, verbose)
+            terms = await page.evaluate(
+                "() => Array.from("
+                "  document.querySelectorAll('#search em')"
+                ").map(el => el.textContent.trim()).filter(t => t.length > 0)"
+            )
+        _log(f"page {page_num}: {len(terms)} terms extracted", t0, verbose)
+        for i, term in enumerate(terms):
+            entry = {"term": term, "page": page_num, "position": i + 1}
+            all_terms.append(entry)
+            if on_term:
+                on_term(entry)
+        pages_scraped += 1
 
-            if page_num < pages:
-                next_link = page.locator("a#pnnext")
-                if await next_link.count() == 0:
-                    print("No more result pages available.", file=sys.stderr)
-                    break
-                sleep_time = max(0.5, delay + random.uniform(-1.0, 1.0))
-                await asyncio.sleep(sleep_time)
-                await next_link.click()
-                await page.wait_for_load_state("domcontentloaded")
-
-        await browser.close()
+        if page_num < pages:
+            # Try both the classic selector and the newer aria-label variant.
+            next_link = page.locator("a#pnnext, a[aria-label='Next page'], a[aria-label='Next']")
+            if await next_link.count() == 0:
+                print("No more result pages available.", file=sys.stderr)
+                break
+            sleep_time = max(0.5, delay + random.uniform(-1.0, 1.0))
+            _log(f"inter-page delay {sleep_time:.1f}s", t0, verbose)
+            await asyncio.sleep(sleep_time)
+            _log(f"navigating to page {page_num + 1}", t0, verbose)
+            await next_link.first.click()
+            await page.wait_for_load_state("domcontentloaded")
+            _log(f"page {page_num + 1} loaded", t0, verbose)
 
     return {
         "query": query,
@@ -503,35 +683,85 @@ async def _run_extraction(query, pages, delay, hl, gl, url, headed, debug=False)
 def main():
     args = parse_args()
 
+    if not args.query and not args.file:
+        print("error: provide a query or --file FILE", file=sys.stderr)
+        sys.exit(2)
+    if args.query and args.file:
+        print("error: provide either a query or --file FILE, not both", file=sys.stderr)
+        sys.exit(2)
+
+    if args.file:
+        try:
+            queries = load_queries_from_file(args.file)
+        except OSError as e:
+            print(f"error: cannot read file: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not queries:
+            print("error: file contains no queries", file=sys.stderr)
+            sys.exit(1)
+    else:
+        queries = [args.query]
+
+    multi = len(queries) > 1
+    # In text mode, stream each term to stdout as it's scraped
+    on_term = (lambda e: print(e["term"], flush=True)) if args.output == "text" else None
+    on_query_start = None
+    if multi and args.output == "text":
+        on_query_start = lambda q: print(f'\n=== Query: "{q}" ===', flush=True)
+
     if args.http:
-        result = extract_bold_terms_http(
-            args.query, args.pages, args.delay, args.hl, args.gl, debug=args.debug
-        )
+        all_results = []
+        for query in queries:
+            if on_query_start:
+                on_query_start(query)
+            all_results.append(
+                extract_bold_terms_http(query, args.pages, args.delay, args.hl, args.gl, debug=args.debug)
+            )
     else:
-        result = asyncio.run(
-            extract_bold_terms(args.query, args.pages, args.delay, args.hl, args.gl, debug=args.debug)
+        browser_info = _detect_browser(args.browser)
+        # Use a browser-specific profile dir unless the user explicitly overrode it
+        if args.profile_dir == DEFAULT_PROFILE_DIR and browser_info["type"] == "firefox":
+            profile_dir = os.path.join(os.path.expanduser("~"), ".serp-bold-extractor", "profile-firefox")
+        else:
+            profile_dir = args.profile_dir
+        all_results = asyncio.run(
+            extract_bold_terms_batch(
+                queries, args.pages, args.delay, args.hl, args.gl,
+                debug=args.debug, on_query_start=on_query_start, on_term=on_term,
+                verbose=args.verbose, profile_dir=profile_dir, browser_info=browser_info,
+            )
         )
 
-    if result.get("error"):
-        print(result["error"], file=sys.stderr)
-        sys.exit(1)
+    json_results = [] if args.output == "json" else None
+    exit_code = 0
 
-    if not result["terms"]:
-        print("No bold terms found for this query.", file=sys.stderr)
+    for result in all_results:
+        if result.get("error"):
+            print(result["error"], file=sys.stderr)
+            exit_code = 1
+            if json_results is not None:
+                json_results.append(result)
+            continue
 
-    if args.output == "json":
-        output = {
-            "query": result["query"],
-            "total_terms": result["total_terms"],
-            "pages_scraped": result["pages_scraped"],
-            "terms": result["terms"],
-        }
-        print(json.dumps(output, indent=2, ensure_ascii=False))
-    else:
         if not result["terms"]:
-            sys.exit(0)
-        for entry in result["terms"]:
-            print(entry["term"])
+            print(f'No bold terms found for "{result["query"]}".', file=sys.stderr)
+            if json_results is not None:
+                json_results.append(result)
+            continue
+
+        if json_results is not None:
+            json_results.append({
+                "query": result["query"],
+                "total_terms": result["total_terms"],
+                "pages_scraped": result["pages_scraped"],
+                "terms": result["terms"],
+            })
+
+    if json_results is not None:
+        output = json_results if multi else (json_results[0] if json_results else {})
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
