@@ -639,6 +639,10 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
     # --- helper: switch from headed to headless (or back) ---
     async def _switch_browser(to_headed):
         nonlocal _pw_cm, context, headed
+        if to_headed:
+            print("[info] Switching to headed mode for CAPTCHA solving...", file=sys.stderr, flush=True)
+        else:
+            print("[info] Session established — switching to headless mode.", file=sys.stderr, flush=True)
         await _close_browser(context, _pw_cm, verbose, t0)
         if to_headed:
             if xvfb_mgr and not xvfb_mgr.running:
