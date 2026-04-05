@@ -671,13 +671,15 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
 
     total_q = len(queries)
 
-    def _status(idx, query, extra=""):
-        """Print progress like [1/5] Scraping "bitcoin"..."""
-        if total_q > 1:
-            msg = f'[{idx}/{total_q}] Scraping "{query}"...{extra}'
+    def _print_query_result(idx, total, query, result):
+        """Print completion status for a query."""
+        n_terms = result.get("total_terms", 0)
+        err = result.get("error")
+        prefix = f'[{idx}/{total}] ' if total > 1 else ''
+        if err and err != "captcha_headless":
+            print(f'{prefix}"{query}" -> error: {err}', file=sys.stderr, flush=True)
         else:
-            msg = f'Scraping "{query}"...{extra}'
-        print(msg, file=sys.stderr, flush=True)
+            print(f'{prefix}"{query}" -> {n_terms} term{"s" if n_terms != 1 else ""} found', file=sys.stderr, flush=True)
 
     try:
         if concurrency == 1:
@@ -685,7 +687,6 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
             for idx, query in enumerate(queries):
                 if on_query_start:
                     on_query_start(query)
-                _status(idx + 1, query)
                 result = await _extract_single_query(first_page, query, pages, delay, hl, gl, app_name, headed, debug, on_term, verbose, t0, save_html_dir=save_html_dir)
                 # Handle captcha_headless fallback
                 if result.get("error") == "captcha_headless":
@@ -694,12 +695,7 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
                     if on_term:
                         for entry in result.get("terms", []):
                             on_term(entry)
-                n_terms = result.get("total_terms", 0)
-                err = result.get("error")
-                if err:
-                    print(f'  -> error: {err}', file=sys.stderr, flush=True)
-                else:
-                    print(f'  -> {n_terms} term{"s" if n_terms != 1 else ""} found', file=sys.stderr, flush=True)
+                _print_query_result(idx + 1, total_q, query, result)
                 results.append(result)
                 # After the first query, switch to headless if enabled
                 if idx == 0 and headless_switch and len(queries) > 1 and headed:
@@ -709,8 +705,8 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
         else:
             # Parallel mode: query 1 runs alone on the single tab (handles any
             # CAPTCHA), then extra tabs are opened and queries 2-N run in parallel.
-            _status(1, queries[0])
             first_result = await _extract_single_query(first_page, queries[0], pages, delay, hl, gl, app_name, headed, debug, None, verbose, t0, save_html_dir=save_html_dir)
+            _print_query_result(1, total_q, queries[0], first_result)
             results = [first_result]
 
             if len(queries) > 1:
@@ -721,8 +717,7 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
                     _log("headless browser ready", t0, verbose)
 
                 remaining = queries[1:]
-                if total_q > 1:
-                    print(f'[2-{total_q}/{total_q}] Scraping {len(remaining)} queries in parallel...', file=sys.stderr, flush=True)
+                done_count = 1  # first query already done
 
                 n_tabs = min(concurrency, len(remaining))
                 extra_tabs = [await context.new_page() for _ in range(n_tabs)]
@@ -733,9 +728,17 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
                     await tab_q.put(tab)
 
                 async def run_one(query):
+                    nonlocal done_count
                     tab = await tab_q.get()
                     try:
-                        return await _extract_single_query(tab, query, pages, delay, hl, gl, app_name, headed, debug, None, verbose, t0, save_html_dir=save_html_dir)
+                        r = await _extract_single_query(tab, query, pages, delay, hl, gl, app_name, headed, debug, None, verbose, t0, save_html_dir=save_html_dir)
+                        done_count += 1
+                        _print_query_result(done_count, total_q, query, r)
+                        return r
+                    except BaseException as exc:
+                        done_count += 1
+                        print(f'[{done_count}/{total_q}] "{query}" -> error: {exc}', file=sys.stderr, flush=True)
+                        raise
                     finally:
                         await tab_q.put(tab)
 
@@ -756,16 +759,6 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
                     for result_idx, query in captcha_retries:
                         retry_result = await _retry_with_headed(query)
                         results[result_idx] = retry_result
-
-            # Print per-query summary for parallel results
-            for i, result in enumerate(results):
-                n_terms = result.get("total_terms", 0)
-                err = result.get("error")
-                q = result.get("query", queries[i])
-                if err:
-                    print(f'  [{i+1}/{total_q}] "{q}" -> error: {err}', file=sys.stderr, flush=True)
-                else:
-                    print(f'  [{i+1}/{total_q}] "{q}" -> {n_terms} term{"s" if n_terms != 1 else ""} found', file=sys.stderr, flush=True)
 
             # Emit all buffered output in original query order
             for result in results:
