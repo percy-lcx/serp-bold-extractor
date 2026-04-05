@@ -137,6 +137,11 @@ notes:
         metavar="N",
         help="Number of parallel browser tabs for batch queries (default: 3, range: 1-5)",
     )
+    parser.add_argument(
+        "--no-headless-switch",
+        action="store_true",
+        help="Stay in headed mode for the entire session (don't switch to headless after CAPTCHA)",
+    )
     return parser.parse_args()
 
 
@@ -350,6 +355,41 @@ def _start_xvfb():
     return None, None
 
 
+class _XvfbManager:
+    """Manage Xvfb lifecycle — can be started/stopped multiple times for headless switching."""
+
+    def __init__(self):
+        self.proc = None
+        self._original_display = os.environ.get("DISPLAY")
+        self.available = sys.platform not in ("darwin", "win32") and shutil.which("Xvfb") is not None
+
+    def start(self):
+        """Start Xvfb if available. Returns True if a virtual display is running."""
+        if not self.available or self.proc is not None:
+            return self.proc is not None
+        self.proc, display = _start_xvfb()
+        if self.proc:
+            os.environ["DISPLAY"] = display
+            return True
+        return False
+
+    def stop(self):
+        """Terminate Xvfb and restore the original DISPLAY."""
+        if self.proc is None:
+            return
+        self.proc.terminate()
+        self.proc.wait()
+        self.proc = None
+        if self._original_display is not None:
+            os.environ["DISPLAY"] = self._original_display
+        elif "DISPLAY" in os.environ:
+            del os.environ["DISPLAY"]
+
+    @property
+    def running(self):
+        return self.proc is not None
+
+
 def _detect_browser(pref):
     """Detect a browser based on preference string.
     Returns dict: {type, channel, executable, app_name}
@@ -424,32 +464,24 @@ def _detect_browser(pref):
     return _try_chrome() or _try_brave() or _try_firefox() or _bundled()
 
 
-async def extract_bold_terms_batch(queries, pages, delay, hl, gl, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None, save_html_dir=None, concurrency=3):
+async def extract_bold_terms_batch(queries, pages, delay, hl, gl, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None, save_html_dir=None, concurrency=3, headless_switch=True):
     """Launch browser once, scrape all queries, return list of result dicts."""
+    xvfb_mgr = _XvfbManager()
+
     # On macOS/Windows a real display is always available — run headed without Xvfb.
-    if sys.platform in ("darwin", "win32"):
-        return await _run_extraction_batch(queries, pages, delay, hl, gl, True, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info, save_html_dir=save_html_dir, concurrency=concurrency)
-
-    # On Linux: use headed mode with Xvfb virtual display to avoid headless detection
-    use_xvfb = shutil.which("Xvfb") is not None
-    xvfb_proc = None
-    original_display = os.environ.get("DISPLAY")
-
-    if use_xvfb:
-        xvfb_proc, display = _start_xvfb()
-        if xvfb_proc:
-            os.environ["DISPLAY"] = display
+    # On Linux: start Xvfb virtual display so the browser can run headed.
+    headed = True
+    if sys.platform not in ("darwin", "win32"):
+        if xvfb_mgr.available:
+            xvfb_mgr.start()
+            headed = xvfb_mgr.running
+        else:
+            headed = False
 
     try:
-        return await _run_extraction_batch(queries, pages, delay, hl, gl, use_xvfb and xvfb_proc is not None, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info, save_html_dir=save_html_dir, concurrency=concurrency)
+        return await _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug, on_query_start=on_query_start, on_term=on_term, verbose=verbose, profile_dir=profile_dir, browser_info=browser_info, save_html_dir=save_html_dir, concurrency=concurrency, headless_switch=headless_switch, xvfb_mgr=xvfb_mgr)
     finally:
-        if xvfb_proc:
-            xvfb_proc.terminate()
-            xvfb_proc.wait()
-            if original_display is not None:
-                os.environ["DISPLAY"] = original_display
-            elif "DISPLAY" in os.environ:
-                del os.environ["DISPLAY"]
+        xvfb_mgr.stop()
 
 
 def _log(msg, t0, verbose):
@@ -483,15 +515,14 @@ def _macos_activate(app_name):
         pass
 
 
-async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None, save_html_dir=None, concurrency=3):
-    """Launch browser once, process all queries, return list of result dicts."""
-    t0 = time.perf_counter()
-    _log(f'launching {browser_info["app_name"]}', t0, verbose)
+async def _launch_browser(profile_dir, browser_info, headed, verbose, t0):
+    """Launch a persistent browser context.
 
+    Returns (pw_context_manager, context) — caller must close both.
+    """
     is_chromium = browser_info["type"] == "chromium"
+    _log(f'launching {browser_info["app_name"]} ({"headed" if headed else "headless"})', t0, verbose)
 
-    # Use manual lifecycle management instead of `async with` so we can apply
-    # a timeout to both browser.close() and playwright.stop().
     if is_chromium:
         if sys.platform == "win32":
             _nav_platform = "Win32"
@@ -500,11 +531,11 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
         else:
             _nav_platform = "Linux x86_64"
         _stealth = Stealth(navigator_platform_override=_nav_platform)
-        _pw_cm = _stealth.use_async(async_playwright())
+        pw_cm = _stealth.use_async(async_playwright())
     else:
         _stealth = None
-        _pw_cm = async_playwright()
-    p = await _pw_cm.__aenter__()
+        pw_cm = async_playwright()
+    p = await pw_cm.__aenter__()
 
     os.makedirs(profile_dir, exist_ok=True)
 
@@ -547,6 +578,28 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
         context = await p.firefox.launch_persistent_context(profile_dir, **persistent_kwargs)
 
     _log("browser launched", t0, verbose)
+    return pw_cm, context
+
+
+async def _close_browser(context, pw_cm, verbose, t0):
+    """Close browser context and stop Playwright."""
+    _log("closing browser", t0, verbose)
+    try:
+        await asyncio.wait_for(context.close(), timeout=2.0)
+    except (asyncio.TimeoutError, Exception):
+        pass
+    _log("browser closed — stopping Playwright", t0, verbose)
+    try:
+        await asyncio.wait_for(pw_cm.__aexit__(None, None, None), timeout=2.0)
+    except (asyncio.TimeoutError, Exception):
+        pass
+
+
+async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=False, on_query_start=None, on_term=None, verbose=False, profile_dir=None, browser_info=None, save_html_dir=None, concurrency=3, headless_switch=True, xvfb_mgr=None):
+    """Launch browser once, process all queries, return list of result dicts."""
+    t0 = time.perf_counter()
+
+    _pw_cm, context = await _launch_browser(profile_dir, browser_info, headed, verbose, t0)
 
     # Return focus to whatever was frontmost before the browser launched
     prior_app = _macos_get_frontmost() if sys.platform == "darwin" else None
@@ -568,14 +621,7 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
             await first_page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
         except (PlaywrightTimeout, Exception) as e:
             err = f"Failed to reach Google: {e}"
-            try:
-                await asyncio.wait_for(context.close(), timeout=2.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
-            try:
-                await asyncio.wait_for(_pw_cm.__aexit__(None, None, None), timeout=2.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
+            await _close_browser(context, _pw_cm, verbose, t0)
             return [{"query": q, "total_terms": 0, "pages_scraped": 0, "terms": [], "error": err} for q in queries]
         _log("google.com loaded", t0, verbose)
 
@@ -589,14 +635,56 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
     app_name = browser_info["app_name"]
     multi = len(queries) > 1
     results = []
+
+    # --- helper: switch from headed to headless (or back) ---
+    async def _switch_browser(to_headed):
+        nonlocal _pw_cm, context, headed
+        await _close_browser(context, _pw_cm, verbose, t0)
+        if to_headed:
+            if xvfb_mgr and not xvfb_mgr.running:
+                xvfb_mgr.start()
+        else:
+            if xvfb_mgr and xvfb_mgr.running:
+                xvfb_mgr.stop()
+        await asyncio.sleep(0.5)  # allow profile lock release
+        _pw_cm, context = await _launch_browser(profile_dir, browser_info, to_headed, verbose, t0)
+        headed = to_headed
+        return context.pages[0] if context.pages else await context.new_page()
+
+    # --- helper: handle captcha_headless by falling back to headed ---
+    async def _retry_with_headed(query):
+        """Re-run a single query in headed mode after a headless CAPTCHA, then switch back."""
+        nonlocal _pw_cm, context, headed
+        _log("CAPTCHA in headless mode — falling back to headed", t0, verbose)
+        page = await _switch_browser(to_headed=True)
+        result = await _extract_single_query(page, query, pages, delay, hl, gl, app_name, True, debug, None, verbose, t0, save_html_dir=save_html_dir)
+        # Switch back to headless for remaining queries
+        await _switch_browser(to_headed=False)
+        if result.get("error") == "captcha_headless":
+            # Headed retry should never return this, but guard against it
+            result["error"] = "CAPTCHA detected. Try again later or reduce request frequency."
+        return result
+
     try:
         if concurrency == 1:
             # Sequential mode: preserve streaming output
-            for query in queries:
+            for idx, query in enumerate(queries):
                 if on_query_start:
                     on_query_start(query)
                 result = await _extract_single_query(first_page, query, pages, delay, hl, gl, app_name, headed, debug, on_term, verbose, t0, save_html_dir=save_html_dir)
+                # Handle captcha_headless fallback
+                if result.get("error") == "captcha_headless":
+                    result = await _retry_with_headed(query)
+                    first_page = context.pages[0] if context.pages else await context.new_page()
+                    if on_term:
+                        for entry in result.get("terms", []):
+                            on_term(entry)
                 results.append(result)
+                # After the first query, switch to headless if enabled
+                if idx == 0 and headless_switch and len(queries) > 1 and headed:
+                    _log("switching to headless mode", t0, verbose)
+                    first_page = await _switch_browser(to_headed=False)
+                    _log("headless browser ready", t0, verbose)
         else:
             # Parallel mode: query 1 runs alone on the single tab (handles any
             # CAPTCHA), then extra tabs are opened and queries 2-N run in parallel.
@@ -604,6 +692,12 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
             results = [first_result]
 
             if len(queries) > 1:
+                # Switch to headless before opening extra tabs
+                if headless_switch and headed:
+                    _log("switching to headless mode", t0, verbose)
+                    first_page = await _switch_browser(to_headed=False)
+                    _log("headless browser ready", t0, verbose)
+
                 n_tabs = min(concurrency, len(queries) - 1)
                 extra_tabs = [await context.new_page() for _ in range(n_tabs)]
                 tab_pool = [first_page] + extra_tabs
@@ -620,11 +714,22 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
                         await tab_q.put(tab)
 
                 raw = await asyncio.gather(*[run_one(q) for q in queries[1:]], return_exceptions=True)
+                # Collect results, noting any captcha_headless failures for retry
+                captcha_retries = []
                 for q, r in zip(queries[1:], raw):
                     if isinstance(r, BaseException):
                         results.append({"query": q, "total_terms": 0, "pages_scraped": 0, "terms": [], "error": str(r)})
+                    elif isinstance(r, dict) and r.get("error") == "captcha_headless":
+                        captcha_retries.append((len(results), q))
+                        results.append(r)  # placeholder
                     else:
                         results.append(r)
+
+                # Retry captcha_headless queries one by one in headed mode
+                if captcha_retries:
+                    for result_idx, query in captcha_retries:
+                        retry_result = await _retry_with_headed(query)
+                        results[result_idx] = retry_result
 
             # Emit all buffered output in original query order
             for result in results:
@@ -634,17 +739,13 @@ async def _run_extraction_batch(queries, pages, delay, hl, gl, headed, debug=Fal
                     for entry in result.get("terms", []):
                         on_term(entry)
     finally:
-        _log("closing browser", t0, verbose)
-        try:
-            await asyncio.wait_for(context.close(), timeout=2.0)
-        except (asyncio.TimeoutError, Exception):
-            pass
-        _log("browser closed — stopping Playwright", t0, verbose)
-        try:
-            await asyncio.wait_for(_pw_cm.__aexit__(None, None, None), timeout=2.0)
-        except (asyncio.TimeoutError, Exception):
-            pass
+        await _close_browser(context, _pw_cm, verbose, t0)
         _log("done", t0, verbose)
+
+    # Sanitise internal sentinel — should never leak but guard against it
+    for r in results:
+        if isinstance(r, dict) and r.get("error") == "captcha_headless":
+            r["error"] = "CAPTCHA detected. Try again later or reduce request frequency."
 
     return results
 
@@ -723,7 +824,7 @@ async def _extract_single_query(page, query, pages, delay, hl, gl, app_name, hea
                     "total_terms": len(all_terms),
                     "pages_scraped": pages_scraped,
                     "terms": all_terms,
-                    "error": "CAPTCHA detected. Try again later or reduce request frequency.",
+                    "error": "captcha_headless",
                 }
 
         # Wait for rendered result snippets (<em> tags appear after JS renders)
@@ -840,6 +941,7 @@ def main():
                 debug=args.debug, on_query_start=on_query_start, on_term=on_term,
                 verbose=args.verbose, profile_dir=profile_dir, browser_info=browser_info,
                 save_html_dir=args.save_html, concurrency=args.concurrency,
+                headless_switch=not args.no_headless_switch,
             )
         )
 
